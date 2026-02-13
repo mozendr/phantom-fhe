@@ -1,9 +1,49 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/complex.h>
+#include <complex>
 
 #include "phantom.h"
 
 namespace py = pybind11;
+
+// Type caster for cuDoubleComplex <-> Python complex
+namespace pybind11 { namespace detail {
+    template <> struct type_caster<cuDoubleComplex> {
+    public:
+        PYBIND11_TYPE_CASTER(cuDoubleComplex, const_name("complex"));
+
+        // Python -> C++ (loading)
+        bool load(handle src, bool) {
+            if (!src) return false;
+            if (PyComplex_Check(src.ptr())) {
+                value.x = PyComplex_RealAsDouble(src.ptr());
+                value.y = PyComplex_ImagAsDouble(src.ptr());
+                return true;
+            }
+            if (PyFloat_Check(src.ptr()) || PyLong_Check(src.ptr())) {
+                value.x = PyFloat_AsDouble(src.ptr());
+                value.y = 0.0;
+                return true;
+            }
+            // Try tuple/list of 2 floats
+            if (PyTuple_Check(src.ptr()) || PyList_Check(src.ptr())) {
+                py::sequence seq = py::reinterpret_borrow<py::sequence>(src);
+                if (seq.size() == 2) {
+                    value.x = seq[0].cast<double>();
+                    value.y = seq[1].cast<double>();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // C++ -> Python (casting)
+        static handle cast(cuDoubleComplex src, return_value_policy, handle) {
+            return PyComplex_FromDoubles(src.x, src.y);
+        }
+    };
+}}
 
 PYBIND11_MODULE(pyPhantom, m) {
 
