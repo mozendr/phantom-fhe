@@ -4,6 +4,7 @@
 #include <complex>
 
 #include "phantom.h"
+#include "bootstrap.cuh"
 
 namespace py = pybind11;
 
@@ -160,7 +161,10 @@ PYBIND11_MODULE(pyPhantom, m) {
 
     py::class_<PhantomCiphertext>(m, "ciphertext")
             .def(py::init<>())
-            .def("set_scale", &PhantomCiphertext::set_scale);
+            .def("set_scale", &PhantomCiphertext::set_scale)
+            .def("chain_index", &PhantomCiphertext::chain_index)
+            .def("coeff_modulus_size", &PhantomCiphertext::coeff_modulus_size)
+            .def("scale", &PhantomCiphertext::scale);
 
     m.def("negate", &phantom::negate, py::arg(), py::arg());
 
@@ -203,4 +207,24 @@ PYBIND11_MODULE(pyPhantom, m) {
     m.def("rotate", &phantom::rotate, py::arg(), py::arg(), py::arg(), py::arg());
 
     m.def("hoisting", &phantom::hoisting, py::arg(), py::arg(), py::arg(), py::arg());
+
+    py::class_<phantom::CKKSBootstrapper>(m, "ckks_bootstrapper")
+            .def(py::init<PhantomCKKSEncoder &>())
+            .def("setup", &phantom::CKKSBootstrapper::setup,
+                 py::arg(), py::arg(),
+                 py::arg("dim1") = std::vector<uint32_t>{0, 0},
+                 py::arg("num_slots") = 0,
+                 py::arg("correction_factor") = 0)
+            .def("keygen", &phantom::CKKSBootstrapper::keygen,
+                 py::arg(), py::arg(), py::arg("num_slots") = 0)
+            .def("bootstrap", &phantom::CKKSBootstrapper::bootstrap,
+                 py::arg(), py::arg(), py::arg("num_slots") = 0)
+            .def("bootstrap_debug", &phantom::CKKSBootstrapper::bootstrap_debug,
+                 py::arg(), py::arg(), py::arg(), py::arg("num_slots") = 0)
+            .def("coeffs_to_slots", &phantom::CKKSBootstrapper::coeffs_to_slots,
+                 py::arg(), py::arg(), py::arg("num_slots") = 0)
+            .def("slots_to_coeffs", &phantom::CKKSBootstrapper::slots_to_coeffs,
+                 py::arg(), py::arg(), py::arg("num_slots") = 0)
+            .def_static("get_bootstrap_depth", &phantom::CKKSBootstrapper::get_bootstrap_depth)
+            .def_static("get_galois_elements", &phantom::CKKSBootstrapper::get_galois_elements);
 }

@@ -156,5 +156,9 @@ namespace phantom::util {
 
         void apply_galois_ntt(uint64_t *operand, size_t coeff_mod_size, size_t galois_elt_idx, uint64_t *result,
                               const cudaStream_t &stream);
+
+        void apply_galois_ntt_direct(uint64_t *operand, size_t coeff_mod_size,
+                                     uint64_t *result, uint32_t *permutation_table,
+                                     const cudaStream_t &stream);
     };
 }
