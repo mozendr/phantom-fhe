@@ -64,12 +64,6 @@ public:
                                 PhantomCiphertext& ct,
                                 uint32_t num_slots = 0);
 
-    // Debug version with intermediate decryption
-    PhantomCiphertext bootstrap_debug(const PhantomContext& context,
-                                      PhantomCiphertext& ct,
-                                      PhantomSecretKey& sk,
-                                      uint32_t num_slots = 0);
-
     static uint32_t get_bootstrap_depth(const std::vector<uint32_t>& level_budget);
 
     static std::vector<uint32_t> get_galois_elements(

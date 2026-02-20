@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/complex.h>
+#include <pybind11/numpy.h>
 #include <complex>
 
 #include "phantom.h"
@@ -8,13 +9,11 @@
 
 namespace py = pybind11;
 
-// Type caster for cuDoubleComplex <-> Python complex
 namespace pybind11 { namespace detail {
     template <> struct type_caster<cuDoubleComplex> {
     public:
         PYBIND11_TYPE_CASTER(cuDoubleComplex, const_name("complex"));
 
-        // Python -> C++ (loading)
         bool load(handle src, bool) {
             if (!src) return false;
             if (PyComplex_Check(src.ptr())) {
@@ -27,7 +26,6 @@ namespace pybind11 { namespace detail {
                 value.y = 0.0;
                 return true;
             }
-            // Try tuple/list of 2 floats
             if (PyTuple_Check(src.ptr()) || PyList_Check(src.ptr())) {
                 py::sequence seq = py::reinterpret_borrow<py::sequence>(src);
                 if (seq.size() == 2) {
@@ -39,7 +37,6 @@ namespace pybind11 { namespace detail {
             return false;
         }
 
-        // C++ -> Python (casting)
         static handle cast(cuDoubleComplex src, return_value_policy, handle) {
             return PyComplex_FromDoubles(src.x, src.y);
         }
@@ -154,10 +151,129 @@ PYBIND11_MODULE(pyPhantom, m) {
                  py::arg(), py::arg())
             .def("decode_double_vector",
                  py::overload_cast<const PhantomContext &, const PhantomPlaintext &>(
-                         &PhantomCKKSEncoder::decode<double>), py::arg(), py::arg());
+                         &PhantomCKKSEncoder::decode<double>), py::arg(), py::arg())
+            .def("encode_double_vector_batch",
+                 [](PhantomCKKSEncoder &self, const PhantomContext &ctx,
+                    py::array_t<double, py::array::c_style | py::array::forcecast> batch_data,
+                    double scale, size_t chain_index) {
+                     auto buf = batch_data.request();
+                     if (buf.ndim != 2)
+                         throw std::invalid_argument("batch_data must be a 2D numpy array");
+                     return self.encode_batch(ctx,
+                                              static_cast<const double*>(buf.ptr),
+                                              buf.shape[0], buf.shape[1],
+                                              scale, chain_index);
+                 },
+                 py::arg("ctx"), py::arg("batch_data"), py::arg("scale"),
+                 py::arg("chain_index") = 1)
+            .def("encode_complex_vector_batch",
+                 [](PhantomCKKSEncoder &self, const PhantomContext &ctx,
+                    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> batch_data,
+                    double scale, size_t chain_index) {
+                     auto buf = batch_data.request();
+                     if (buf.ndim != 2)
+                         throw std::invalid_argument("batch_data must be a 2D numpy array");
+                     return self.encode_batch_complex(ctx,
+                                                      reinterpret_cast<const cuDoubleComplex*>(buf.ptr),
+                                                      buf.shape[0], buf.shape[1],
+                                                      scale, chain_index);
+                 },
+                 py::arg("ctx"), py::arg("batch_data"), py::arg("scale"),
+                 py::arg("chain_index") = 1);
 
     py::class_<PhantomPlaintext>(m, "plaintext")
-            .def(py::init<>());
+            .def(py::init<>())
+            .def("chain_index", &PhantomPlaintext::chain_index)
+            .def("scale", &PhantomPlaintext::scale)
+            .def("coeff_modulus_size", &PhantomPlaintext::coeff_modulus_size)
+            .def("poly_modulus_degree", &PhantomPlaintext::poly_modulus_degree)
+            .def("set_chain_index", &PhantomPlaintext::set_chain_index)
+            .def("set_scale", &PhantomPlaintext::set_scale);
+
+    m.def("offload_plaintexts",
+        [](py::list pts) -> py::tuple {
+            size_t n = pts.size();
+            if (n == 0) throw std::invalid_argument("empty plaintext list");
+
+            auto& first = pts[0].cast<PhantomPlaintext&>();
+            size_t cms = first.coeff_modulus_size();
+            size_t pmd = first.poly_modulus_degree();
+            size_t chain_idx = first.chain_index();
+            double scale = first.scale();
+            size_t elem_count = cms * pmd;
+            size_t total_bytes = n * elem_count * sizeof(uint64_t);
+
+            uint64_t* d_staging;
+            cudaMalloc(&d_staging, total_bytes);
+            for (size_t i = 0; i < n; i++) {
+                auto& pt = pts[i].cast<PhantomPlaintext&>();
+                cudaMemcpyAsync(d_staging + i * elem_count, pt.data(),
+                                elem_count * sizeof(uint64_t),
+                                cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            }
+
+            auto result = py::array_t<uint64_t>({(py::ssize_t)n, (py::ssize_t)elem_count});
+            auto buf = result.request();
+            uint64_t* h_pinned;
+            cudaMallocHost(&h_pinned, total_bytes);
+            cudaStreamSynchronize(cudaStreamPerThread);
+            cudaMemcpy(h_pinned, d_staging, total_bytes, cudaMemcpyDeviceToHost);
+            memcpy(buf.ptr, h_pinned, total_bytes);
+
+            cudaFreeHost(h_pinned);
+            cudaFree(d_staging);
+            return py::make_tuple(result, chain_idx, scale, cms, pmd);
+        },
+        py::arg("pts"));
+
+    m.def("upload_plaintexts",
+        [](py::array_t<uint64_t, py::array::c_style | py::array::forcecast> data,
+           size_t chain_index, double scale,
+           size_t cms, size_t pmd) -> py::list {
+            auto buf = data.request();
+            if (buf.ndim != 2)
+                throw std::invalid_argument("data must be a 2D numpy array");
+
+            size_t n = buf.shape[0];
+            size_t elem_count = buf.shape[1];
+            if (elem_count != cms * pmd)
+                throw std::invalid_argument("element count mismatch: expected cms*pmd");
+
+            size_t total_bytes = n * elem_count * sizeof(uint64_t);
+
+            uint64_t* h_pinned;
+            cudaMallocHost(&h_pinned, total_bytes);
+            memcpy(h_pinned, buf.ptr, total_bytes);
+
+            uint64_t* d_staging;
+            cudaMalloc(&d_staging, total_bytes);
+            cudaMemcpy(d_staging, h_pinned, total_bytes, cudaMemcpyHostToDevice);
+            cudaFreeHost(h_pinned);
+
+            std::vector<PhantomPlaintext> pts_vec(n);
+            for (size_t i = 0; i < n; i++) {
+                pts_vec[i].resize(cms, pmd, cudaStreamPerThread);
+            }
+
+            for (size_t i = 0; i < n; i++) {
+                cudaMemcpyAsync(pts_vec[i].data(), d_staging + i * elem_count,
+                                elem_count * sizeof(uint64_t),
+                                cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+                pts_vec[i].set_chain_index(chain_index);
+                pts_vec[i].set_scale(scale);
+            }
+
+            cudaStreamSynchronize(cudaStreamPerThread);
+            cudaFree(d_staging);
+
+            py::list result;
+            for (size_t i = 0; i < n; i++) {
+                result.append(std::move(pts_vec[i]));
+            }
+            return result;
+        },
+        py::arg("data"), py::arg("chain_index"), py::arg("scale"),
+        py::arg("cms"), py::arg("pmd"));
 
     py::class_<PhantomCiphertext>(m, "ciphertext")
             .def(py::init<>())
@@ -219,12 +335,261 @@ PYBIND11_MODULE(pyPhantom, m) {
                  py::arg(), py::arg(), py::arg("num_slots") = 0)
             .def("bootstrap", &phantom::CKKSBootstrapper::bootstrap,
                  py::arg(), py::arg(), py::arg("num_slots") = 0)
-            .def("bootstrap_debug", &phantom::CKKSBootstrapper::bootstrap_debug,
-                 py::arg(), py::arg(), py::arg(), py::arg("num_slots") = 0)
             .def("coeffs_to_slots", &phantom::CKKSBootstrapper::coeffs_to_slots,
                  py::arg(), py::arg(), py::arg("num_slots") = 0)
             .def("slots_to_coeffs", &phantom::CKKSBootstrapper::slots_to_coeffs,
                  py::arg(), py::arg(), py::arg("num_slots") = 0)
             .def_static("get_bootstrap_depth", &phantom::CKKSBootstrapper::get_bootstrap_depth)
             .def_static("get_galois_elements", &phantom::CKKSBootstrapper::get_galois_elements);
+
+    // BSGS inner loop in C++: multiply_plain + add + giant rotations + rescale
+    m.def("bsgs_multiply_accumulate",
+        [](const PhantomContext &ctx,
+           py::list ct_babies_list,
+           py::list diags_list,
+           size_t G, size_t B, size_t D,
+           const PhantomGaloisKey &gk) -> PhantomCiphertext {
+
+            if (ct_babies_list.size() < static_cast<py::ssize_t>(G))
+                throw std::invalid_argument("ct_babies must have at least G elements");
+            if (diags_list.size() < static_cast<py::ssize_t>(D))
+                throw std::invalid_argument("diags must have at least D elements");
+
+            std::vector<const PhantomCiphertext*> ct_babies(G);
+            std::vector<const PhantomPlaintext*> diags(D);
+
+            for (size_t b = 0; b < G; b++)
+                ct_babies[b] = &ct_babies_list[b].cast<const PhantomCiphertext&>();
+            for (size_t k = 0; k < D; k++)
+                diags[k] = &diags_list[k].cast<const PhantomPlaintext&>();
+
+            PhantomCiphertext result;
+            bool result_init = false;
+
+            {
+                py::gil_scoped_release release;
+
+                for (size_t g = 0; g < B; g++) {
+                    PhantomCiphertext inner;
+                    bool inner_init = false;
+
+                    for (size_t b = 0; b < G; b++) {
+                        size_t k = g * G + b;
+                        if (k >= D) continue;
+
+                        auto term = phantom::multiply_plain(ctx, *ct_babies[b], *diags[k]);
+
+                        if (!inner_init) {
+                            inner = std::move(term);
+                            inner_init = true;
+                        } else {
+                            phantom::add_inplace(ctx, inner, term);
+                        }
+                    }
+
+                    if (!inner_init) continue;
+
+                    if (g > 0) {
+                        phantom::rotate_inplace(ctx, inner,
+                                                static_cast<int>(g * G), gk);
+                    }
+
+                    if (!result_init) {
+                        result = std::move(inner);
+                        result_init = true;
+                    } else {
+                        phantom::add_inplace(ctx, result, inner);
+                    }
+                }
+
+                phantom::rescale_to_next_inplace(ctx, result);
+            }
+
+            return result;
+        },
+        py::arg("ctx"), py::arg("ct_babies"), py::arg("diags"),
+        py::arg("G"), py::arg("B"), py::arg("D"), py::arg("gk"));
+
+    // BSGS from CPU-offloaded diagonals with persistent staging buffer
+    m.def("bsgs_from_cpu",
+        [](const PhantomContext &ctx,
+           py::list ct_babies_list,
+           py::array_t<uint64_t, py::array::c_style | py::array::forcecast> cpu_diags,
+           size_t chain_index, double scale,
+           size_t cms, size_t pmd,
+           size_t G, size_t B, size_t D,
+           const PhantomGaloisKey &gk) -> PhantomCiphertext {
+
+            if (ct_babies_list.size() < static_cast<py::ssize_t>(G))
+                throw std::invalid_argument("ct_babies must have at least G elements");
+
+            auto buf = cpu_diags.request();
+            if (buf.ndim != 2 || static_cast<size_t>(buf.shape[0]) < D)
+                throw std::invalid_argument("cpu_diags must be (D, elem_count) uint64 array");
+
+            size_t elem_count = cms * pmd;
+            size_t total_bytes = D * elem_count * sizeof(uint64_t);
+
+            std::vector<const PhantomCiphertext*> ct_babies(G);
+            for (size_t b = 0; b < G; b++)
+                ct_babies[b] = &ct_babies_list[b].cast<const PhantomCiphertext&>();
+
+            PhantomCiphertext result;
+            bool result_init = false;
+
+            {
+                py::gil_scoped_release release;
+
+                // Persistent thread-local staging buffer
+                thread_local uint64_t* d_staging = nullptr;
+                thread_local size_t staging_capacity = 0;
+                if (total_bytes > staging_capacity) {
+                    if (d_staging) cudaFree(d_staging);
+                    cudaMalloc(&d_staging, total_bytes);
+                    staging_capacity = total_bytes;
+                }
+
+                // H2D
+                cudaMemcpy(d_staging, buf.ptr, total_bytes, cudaMemcpyHostToDevice);
+
+                // BSGS inner loop
+                for (size_t g = 0; g < B; g++) {
+                    PhantomCiphertext inner;
+                    bool inner_init = false;
+
+                    for (size_t b = 0; b < G; b++) {
+                        size_t k = g * G + b;
+                        if (k >= D) continue;
+
+                        PhantomPlaintext pt;
+                        pt.set_data_view(d_staging + k * elem_count,
+                                         cms, pmd, cudaStreamPerThread);
+                        pt.set_chain_index(chain_index);
+                        pt.set_scale(scale);
+
+                        auto term = phantom::multiply_plain(ctx, *ct_babies[b], pt);
+                        pt.release_data_view();
+
+                        if (!inner_init) {
+                            inner = std::move(term);
+                            inner_init = true;
+                        } else {
+                            phantom::add_inplace(ctx, inner, term);
+                        }
+                    }
+
+                    if (!inner_init) continue;
+
+                    if (g > 0) {
+                        phantom::rotate_inplace(ctx, inner,
+                                                static_cast<int>(g * G), gk);
+                    }
+
+                    if (!result_init) {
+                        result = std::move(inner);
+                        result_init = true;
+                    } else {
+                        phantom::add_inplace(ctx, result, inner);
+                    }
+                }
+
+                phantom::rescale_to_next_inplace(ctx, result);
+            }
+
+            return result;
+        },
+        py::arg("ctx"), py::arg("ct_babies"), py::arg("cpu_diags"),
+        py::arg("chain_index"), py::arg("scale"),
+        py::arg("cms"), py::arg("pmd"),
+        py::arg("G"), py::arg("B"), py::arg("D"), py::arg("gk"));
+
+    // Complete BSGS: baby rotations + H2D + inner loop + rescale, all GIL-released
+    m.def("bsgs_complete_from_cpu",
+        [](const PhantomContext &ctx,
+           const PhantomCiphertext &ct_x,
+           py::array_t<uint64_t, py::array::c_style | py::array::forcecast> cpu_diags,
+           size_t chain_index, double scale,
+           size_t cms, size_t pmd,
+           size_t G, size_t B, size_t D,
+           const PhantomGaloisKey &gk) -> PhantomCiphertext {
+
+            auto buf = cpu_diags.request();
+            if (buf.ndim != 2 || static_cast<size_t>(buf.shape[0]) < D)
+                throw std::invalid_argument("cpu_diags must be (D, elem_count) uint64 array");
+
+            size_t elem_count = cms * pmd;
+            size_t total_bytes = D * elem_count * sizeof(uint64_t);
+
+            PhantomCiphertext result;
+            bool result_init = false;
+
+            {
+                py::gil_scoped_release release;
+
+                // Baby rotations
+                std::vector<PhantomCiphertext> ct_babies(G);
+                ct_babies[0] = ct_x;
+                for (size_t b = 1; b < G; b++) {
+                    ct_babies[b] = phantom::rotate(ctx, ct_x,
+                                                    static_cast<int>(b), gk);
+                }
+
+                // H2D
+                uint64_t* d_staging;
+                cudaMalloc(&d_staging, total_bytes);
+                cudaMemcpy(d_staging, buf.ptr, total_bytes,
+                           cudaMemcpyHostToDevice);
+
+                // BSGS inner loop
+                for (size_t g = 0; g < B; g++) {
+                    PhantomCiphertext inner;
+                    bool inner_init = false;
+
+                    for (size_t b = 0; b < G; b++) {
+                        size_t k = g * G + b;
+                        if (k >= D) continue;
+
+                        PhantomPlaintext pt;
+                        pt.set_data_view(d_staging + k * elem_count,
+                                         cms, pmd, cudaStreamPerThread);
+                        pt.set_chain_index(chain_index);
+                        pt.set_scale(scale);
+
+                        auto term = phantom::multiply_plain(ctx,
+                                                             ct_babies[b], pt);
+                        pt.release_data_view();
+
+                        if (!inner_init) {
+                            inner = std::move(term);
+                            inner_init = true;
+                        } else {
+                            phantom::add_inplace(ctx, inner, term);
+                        }
+                    }
+
+                    if (!inner_init) continue;
+
+                    if (g > 0) {
+                        phantom::rotate_inplace(ctx, inner,
+                                                static_cast<int>(g * G), gk);
+                    }
+
+                    if (!result_init) {
+                        result = std::move(inner);
+                        result_init = true;
+                    } else {
+                        phantom::add_inplace(ctx, result, inner);
+                    }
+                }
+
+                phantom::rescale_to_next_inplace(ctx, result);
+                cudaFree(d_staging);
+            }
+
+            return result;
+        },
+        py::arg("ctx"), py::arg("ct_x"), py::arg("cpu_diags"),
+        py::arg("chain_index"), py::arg("scale"),
+        py::arg("cms"), py::arg("pmd"),
+        py::arg("G"), py::arg("B"), py::arg("D"), py::arg("gk"));
 }

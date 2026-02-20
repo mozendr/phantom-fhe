@@ -946,7 +946,8 @@ void CKKSBootstrapper::setup(
     ksi_pows[m] = ksi_pows[0];
 
     double q_double = static_cast<double>(parms.coeff_modulus()[0].value());
-    unsigned __int128 factor = (unsigned __int128)1 << ((uint32_t)std::round(std::log2(q_double)));
+    unsigned __int128 const_one = 1;
+    unsigned __int128 factor = const_one << ((uint32_t)std::round(std::log2(q_double)));
     double pre = q_double / factor;
     double scale_enc = pre;
     double scale_dec = 1.0 / pre;
@@ -2178,109 +2179,6 @@ PhantomCiphertext CKKSBootstrapper::bootstrap(
 
         return ct_dec;
     }
-}
-
-PhantomCiphertext CKKSBootstrapper::bootstrap_debug(
-    const PhantomContext& context,
-    PhantomCiphertext& ct,
-    PhantomSecretKey& sk,
-    uint32_t num_slots) {
-
-    auto& parms = context.get_context_data(context.get_first_index()).parms();
-    uint32_t N = parms.poly_modulus_degree();
-    uint32_t M = 2 * N;
-    uint32_t slots = (num_slots == 0) ? N / 2 : num_slots;
-
-    auto it = precom_map_.find(slots);
-    if (it == precom_map_.end())
-        throw std::runtime_error("Bootstrap: call setup() first");
-
-    auto debug_decrypt = [&](const char* label, const PhantomCiphertext& c) {
-        PhantomPlaintext pt = sk.decrypt(context, c);
-        auto vals = encoder_.decode<cuDoubleComplex>(context, pt);
-        std::cout << "[DBG] " << label << " chain=" << c.chain_index()
-                  << " scale=" << c.scale() << " nsd=" << c.GetNoiseScaleDeg() << std::endl;
-        for (int i = 0; i < 5; i++)
-            std::cout << "  [" << i << "] " << vals[i].x << " + " << vals[i].y << "i" << std::endl;
-    };
-
-    debug_decrypt("INPUT", ct);
-
-    double q_double = static_cast<double>(parms.coeff_modulus()[0].value());
-    double pow_p = std::pow(2, std::round(std::log2(q_double)));
-    int32_t deg = std::round(std::log2(q_double / pow_p));
-    if (deg < 0) deg = 0;
-    uint32_t correction = correction_factor_ - deg;
-    double post = std::pow(2, static_cast<double>(deg));
-    double pre = 1.0 / post;
-    uint64_t scalar = std::llround(post);
-
-    PhantomCiphertext raised = ct;
-    if (raised.GetNoiseScaleDeg() > 1)
-        rescale_to_next_inplace(context, raised);
-    adjust_ciphertext(context, raised, correction);
-    debug_decrypt("POST-ADJUST", raised);
-
-    while (raised.coeff_modulus_size() > 1) {
-        mod_switch_to_next_inplace(context, raised);
-    }
-
-    raised = mod_raise(context, raised);
-    debug_decrypt("POST-MODRAISE", raised);
-
-    double scale_mult_1 = pre * (1.0 / K_UNIFORM);
-    double scale_mult_2 = 1.0 / N;
-    mult_by_const(context, raised, scale_mult_1);
-    rescale_to_next_inplace(context, raised);
-    debug_decrypt("POST-SCALE-1", raised);
-    mult_by_const(context, raised, scale_mult_2);
-    rescale_to_next_inplace(context, raised);
-    debug_decrypt("POST-SCALE-2", raised);
-
-    auto ct_enc = coeffs_to_slots(context, raised, slots);
-    debug_decrypt("POST-C2S", ct_enc);
-
-    rescale_to_next_inplace(context, ct_enc);
-
-    auto conj = conjugate(context, ct_enc);
-    conj.set_scale(ct_enc.scale());
-    auto ct_enc_i = sub(context, ct_enc, conj);
-    add_inplace(context, ct_enc, conj);
-    mult_by_monomial(context, ct_enc_i, 3 * M / 4);
-
-    debug_decrypt("REAL", ct_enc);
-    debug_decrypt("IMAG", ct_enc_i);
-
-    ct_enc = eval_chebyshev(context, ct_enc, chebyshev_coeffs_, -1.0, 1.0);
-    ct_enc_i = eval_chebyshev(context, ct_enc_i, chebyshev_coeffs_, -1.0, 1.0);
-    debug_decrypt("POST-CHEBYSHEV REAL", ct_enc);
-    debug_decrypt("POST-CHEBYSHEV IMAG", ct_enc_i);
-
-    double_angle_iterations(context, ct_enc, R_UNIFORM);
-    double_angle_iterations(context, ct_enc_i, R_UNIFORM);
-    debug_decrypt("POST-DOUBLE-ANGLE REAL", ct_enc);
-    debug_decrypt("POST-DOUBLE-ANGLE IMAG", ct_enc_i);
-
-    mult_by_monomial(context, ct_enc_i, M / 4);
-    while (ct_enc_i.chain_index() < ct_enc.chain_index())
-        mod_switch_to_next_inplace(context, ct_enc_i);
-    while (ct_enc.chain_index() < ct_enc_i.chain_index())
-        mod_switch_to_next_inplace(context, ct_enc);
-    ct_enc_i.set_scale(ct_enc.scale());
-    add_inplace(context, ct_enc, ct_enc_i);
-    debug_decrypt("POST-COMBINE", ct_enc);
-
-    mult_by_integer(context, ct_enc, scalar);
-    debug_decrypt("POST-SCALAR", ct_enc);
-
-    auto ct_dec = slots_to_coeffs(context, ct_enc, slots);
-    debug_decrypt("POST-S2C", ct_dec);
-
-    uint64_t cor_factor = (uint64_t)1 << std::llround(correction);
-    mult_by_integer(context, ct_dec, cor_factor);
-    debug_decrypt("FINAL", ct_dec);
-
-    return ct_dec;
 }
 
 } // namespace phantom

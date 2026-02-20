@@ -57,6 +57,20 @@ private:
         encode_internal_ext(context, input, chain_index, scale, destination, stream);
     }
 
+    void encode_batch_internal(const PhantomContext &context,
+                                const double *batch_data, size_t batch_size,
+                                size_t values_per_vec, size_t chain_index,
+                                double scale,
+                                std::vector<PhantomPlaintext> &destinations,
+                                const cudaStream_t &stream);
+
+    void encode_batch_internal_complex(const PhantomContext &context,
+                                        const cuDoubleComplex *batch_data,
+                                        size_t batch_size, size_t values_per_vec,
+                                        size_t chain_index, double scale,
+                                        std::vector<PhantomPlaintext> &destinations,
+                                        const cudaStream_t &stream);
+
     void decode_internal(const PhantomContext &context,
                          const PhantomPlaintext &plain,
                          std::vector<cuDoubleComplex> &destination,
@@ -133,6 +147,32 @@ public:
         std::vector<T> destination;
         decode(context, plain, destination);
         return destination;
+    }
+
+    std::vector<PhantomPlaintext> encode_batch(const PhantomContext &context,
+                                                const double *batch_data,
+                                                size_t batch_size,
+                                                size_t values_per_vec,
+                                                double scale,
+                                                size_t chain_index = 1) {
+        const auto &s = cudaStreamPerThread;
+        std::vector<PhantomPlaintext> results;
+        encode_batch_internal(context, batch_data, batch_size, values_per_vec,
+                               chain_index, scale, results, s);
+        return results;
+    }
+
+    std::vector<PhantomPlaintext> encode_batch_complex(const PhantomContext &context,
+                                                        const cuDoubleComplex *batch_data,
+                                                        size_t batch_size,
+                                                        size_t values_per_vec,
+                                                        double scale,
+                                                        size_t chain_index = 1) {
+        const auto &s = cudaStreamPerThread;
+        std::vector<PhantomPlaintext> results;
+        encode_batch_internal_complex(context, batch_data, batch_size, values_per_vec,
+                                       chain_index, scale, results, s);
+        return results;
     }
 
     [[nodiscard]] inline std::size_t slot_count() const noexcept {

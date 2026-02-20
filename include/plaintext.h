@@ -42,8 +42,28 @@ public:
         poly_modulus_degree_ = poly_modulus_degree;
     }
 
+    // Borrow a region of a contiguous GPU buffer without owning it.
+    // Caller must call release_data_view() before destruction.
+    void set_data_view(uint64_t* ptr, size_t coeff_modulus_size,
+                       size_t poly_modulus_degree, const cudaStream_t &stream) {
+        data_ = phantom::util::cuda_auto_ptr<uint64_t>(
+            ptr, coeff_modulus_size * poly_modulus_degree, stream);
+        coeff_modulus_size_ = coeff_modulus_size;
+        poly_modulus_degree_ = poly_modulus_degree;
+    }
+
+    void release_data_view() {
+        data_.release();
+        coeff_modulus_size_ = 0;
+        poly_modulus_degree_ = 0;
+    }
+
     void set_chain_index(const size_t chain_index) {
         chain_index_ = chain_index;
+    }
+
+    void set_scale(double scale) {
+        scale_ = scale;
     }
 
     [[nodiscard]] std::size_t coeff_count() const noexcept {
@@ -64,6 +84,14 @@ public:
 
     [[nodiscard]] auto &data_ptr() noexcept {
         return data_;
+    }
+
+    [[nodiscard]] auto poly_modulus_degree() const noexcept {
+        return poly_modulus_degree_;
+    }
+
+    [[nodiscard]] auto coeff_modulus_size() const noexcept {
+        return coeff_modulus_size_;
     }
 
     void save(std::ostream &stream) const {
