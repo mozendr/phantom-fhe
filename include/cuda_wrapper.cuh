@@ -179,6 +179,14 @@ namespace phantom::util {
             n_ = 0;
             cudaStream_ = nullptr;
         }
+
+        T* release() noexcept {
+            T* p = ptr_;
+            ptr_ = nullptr;
+            n_ = 0;
+            cudaStream_ = nullptr;
+            return p;
+        }
     };
 
     template<class T>
