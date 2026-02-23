@@ -70,3 +70,7 @@ public:
 void special_fft_forward(DCKKSEncoderInfo &gp, size_t log_n, const cudaStream_t &stream);
 
 void special_fft_backward(DCKKSEncoderInfo &gp, size_t log_n, double scalar, const cudaStream_t &stream);
+
+void special_fft_backward_buf(cuDoubleComplex *data, const cuDoubleComplex *twiddle,
+                               const uint32_t *mul_group, uint32_t m,
+                               size_t log_n, double scalar, const cudaStream_t &stream);

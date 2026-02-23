@@ -420,3 +420,40 @@ void special_fft_backward(DCKKSEncoderInfo &gp, size_t log_n, double scalar, con
         }
     }
 }
+
+void special_fft_backward_buf(cuDoubleComplex *data, const cuDoubleComplex *twiddle,
+                               const uint32_t *mul_group, uint32_t m,
+                               size_t log_n, double scalar, const cudaStream_t &stream) {
+    uint32_t threadsPerBlock, blocksPerGrid;
+    size_t n = 1 << log_n;
+    if (n <= SWITCH_POINT) {
+        uint32_t iter = 0;
+        uint32_t numOfGroups = 1;
+        threadsPerBlock = n >> 1;
+        blocksPerGrid = 1;
+        inplace_special_ifft_base_kernel<<<
+        blocksPerGrid, threadsPerBlock, n * sizeof(cuDoubleComplex), stream>>>(
+                data, twiddle, mul_group, n, log_n, numOfGroups, iter, m, scalar);
+    } else {
+        int32_t iter = log_n - log2(SWITCH_POINT);
+        uint32_t numOfGroups = n / SWITCH_POINT;
+        if (iter < 0)
+            iter = 0;
+        if (numOfGroups < 1)
+            numOfGroups = 1;
+
+        threadsPerBlock = NTT_THREAD_PER_BLOCK;
+        blocksPerGrid = std::ceil((float) n / (float) threadsPerBlock / (float) 2);
+
+        inplace_special_ifft_base_kernel<<<
+        blocksPerGrid, threadsPerBlock, SWITCH_POINT * sizeof(cuDoubleComplex), stream>>>(
+                data, twiddle, mul_group, n, log_n, numOfGroups, iter, m, scalar);
+        numOfGroups >>= 1;
+        for (; numOfGroups >= 1; numOfGroups >>= 1) {
+            iter--;
+
+            inplace_special_ifft_iter_kernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+                    data, twiddle, mul_group, n, log_n, numOfGroups, iter, m, scalar);
+        }
+    }
+}

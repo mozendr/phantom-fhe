@@ -203,6 +203,147 @@ void PhantomCKKSEncoder::encode_internal_ext(const PhantomContext &context, cons
     destination.scale_ = scale;
 }
 
+void PhantomCKKSEncoder::encode_batch_internal(const PhantomContext &context,
+                                                const double *batch_data, size_t batch_size,
+                                                size_t values_per_vec, size_t chain_index,
+                                                double scale,
+                                                std::vector<PhantomPlaintext> &destinations,
+                                                const cudaStream_t &stream) {
+    if (batch_size == 0) return;
+
+    auto &context_data = context.get_context_data(chain_index);
+    auto &parms = context_data.parms();
+    auto &coeff_modulus = parms.coeff_modulus();
+    auto &rns_tool = context_data.gpu_rns_tool();
+    size_t coeff_modulus_size = coeff_modulus.size();
+    size_t coeff_count = parms.poly_modulus_degree();
+    size_t log_slot_count = arith::get_power_of_two(slots_);
+
+    if (values_per_vec == 0 || values_per_vec > slots_) {
+        throw std::invalid_argument("values_per_vec must be in [1, slots]");
+    }
+    if (scale <= 0 || (static_cast<int>(log2(scale)) + 1 >= context_data.total_coeff_modulus_bit_count())) {
+        throw std::invalid_argument("scale out of bounds");
+    }
+
+    int max_coeff_bit_count = std::min(64, context_data.total_coeff_modulus_bit_count() - 1);
+
+    destinations.resize(batch_size);
+    for (size_t i = 0; i < batch_size; i++) {
+        destinations[i].chain_index_ = 0;
+        destinations[i].resize(coeff_modulus_size, coeff_count, stream);
+    }
+
+    auto batch_fft_buf = make_cuda_auto_ptr<cuDoubleComplex>(batch_size * slots_, stream);
+    cudaMemsetAsync(batch_fft_buf.get(), 0, batch_size * slots_ * sizeof(cuDoubleComplex), stream);
+
+    std::vector<cuDoubleComplex> host_input(batch_size * values_per_vec);
+    for (size_t i = 0; i < batch_size * values_per_vec; i++) {
+        host_input[i] = make_cuDoubleComplex(batch_data[i], 0.0);
+    }
+
+    auto gpu_input = make_cuda_auto_ptr<cuDoubleComplex>(batch_size * values_per_vec, stream);
+    cudaMemcpyAsync(gpu_input.get(), host_input.data(),
+                     batch_size * values_per_vec * sizeof(cuDoubleComplex),
+                     cudaMemcpyHostToDevice, stream);
+
+    double fix = scale / static_cast<double>(slots_);
+
+    for (size_t i = 0; i < batch_size; i++) {
+        cuDoubleComplex *fft_buf = batch_fft_buf.get() + i * slots_;
+        cuDoubleComplex *input_ptr = gpu_input.get() + i * values_per_vec;
+
+        size_t gridDim_br = std::ceil((float)values_per_vec / (float)blockDimGlb.x);
+        bit_reverse_kernel<<<gridDim_br, blockDimGlb, 0, stream>>>(
+            fft_buf, input_ptr, values_per_vec, log_slot_count);
+
+        special_fft_backward_buf(fft_buf,
+                                  gpu_ckks_msg_vec_->twiddle(),
+                                  gpu_ckks_msg_vec_->mul_group(),
+                                  gpu_ckks_msg_vec_->m(),
+                                  log_slot_count, fix, stream);
+
+        rns_tool.base_Ql().decompose_array(
+            destinations[i].data(), fft_buf, coeff_count, max_coeff_bit_count, stream);
+
+        nwt_2d_radix8_forward_inplace(
+            destinations[i].data(), context.gpu_rns_tables(), coeff_modulus_size, 0, stream);
+
+        destinations[i].chain_index_ = chain_index;
+        destinations[i].scale_ = scale;
+    }
+
+    cudaStreamSynchronize(stream);
+}
+
+void PhantomCKKSEncoder::encode_batch_internal_complex(const PhantomContext &context,
+                                                        const cuDoubleComplex *batch_data,
+                                                        size_t batch_size, size_t values_per_vec,
+                                                        size_t chain_index, double scale,
+                                                        std::vector<PhantomPlaintext> &destinations,
+                                                        const cudaStream_t &stream) {
+    if (batch_size == 0) return;
+
+    auto &context_data = context.get_context_data(chain_index);
+    auto &parms = context_data.parms();
+    auto &coeff_modulus = parms.coeff_modulus();
+    auto &rns_tool = context_data.gpu_rns_tool();
+    size_t coeff_modulus_size = coeff_modulus.size();
+    size_t coeff_count = parms.poly_modulus_degree();
+    size_t log_slot_count = arith::get_power_of_two(slots_);
+
+    if (values_per_vec == 0 || values_per_vec > slots_) {
+        throw std::invalid_argument("values_per_vec must be in [1, slots]");
+    }
+    if (scale <= 0 || (static_cast<int>(log2(scale)) + 1 >= context_data.total_coeff_modulus_bit_count())) {
+        throw std::invalid_argument("scale out of bounds");
+    }
+
+    int max_coeff_bit_count = std::min(64, context_data.total_coeff_modulus_bit_count() - 1);
+
+    destinations.resize(batch_size);
+    for (size_t i = 0; i < batch_size; i++) {
+        destinations[i].chain_index_ = 0;
+        destinations[i].resize(coeff_modulus_size, coeff_count, stream);
+    }
+
+    auto batch_fft_buf = make_cuda_auto_ptr<cuDoubleComplex>(batch_size * slots_, stream);
+    cudaMemsetAsync(batch_fft_buf.get(), 0, batch_size * slots_ * sizeof(cuDoubleComplex), stream);
+
+    auto gpu_input = make_cuda_auto_ptr<cuDoubleComplex>(batch_size * values_per_vec, stream);
+    cudaMemcpyAsync(gpu_input.get(), batch_data,
+                     batch_size * values_per_vec * sizeof(cuDoubleComplex),
+                     cudaMemcpyHostToDevice, stream);
+
+    double fix = scale / static_cast<double>(slots_);
+
+    for (size_t i = 0; i < batch_size; i++) {
+        cuDoubleComplex *fft_buf = batch_fft_buf.get() + i * slots_;
+        cuDoubleComplex *input_ptr = gpu_input.get() + i * values_per_vec;
+
+        size_t gridDim_br = std::ceil((float)values_per_vec / (float)blockDimGlb.x);
+        bit_reverse_kernel<<<gridDim_br, blockDimGlb, 0, stream>>>(
+            fft_buf, input_ptr, values_per_vec, log_slot_count);
+
+        special_fft_backward_buf(fft_buf,
+                                  gpu_ckks_msg_vec_->twiddle(),
+                                  gpu_ckks_msg_vec_->mul_group(),
+                                  gpu_ckks_msg_vec_->m(),
+                                  log_slot_count, fix, stream);
+
+        rns_tool.base_Ql().decompose_array(
+            destinations[i].data(), fft_buf, coeff_count, max_coeff_bit_count, stream);
+
+        nwt_2d_radix8_forward_inplace(
+            destinations[i].data(), context.gpu_rns_tables(), coeff_modulus_size, 0, stream);
+
+        destinations[i].chain_index_ = chain_index;
+        destinations[i].scale_ = scale;
+    }
+
+    cudaStreamSynchronize(stream);
+}
+
 void PhantomCKKSEncoder::decode_internal(const PhantomContext &context, const PhantomPlaintext &plain,
                                          std::vector<cuDoubleComplex> &destination, const cudaStream_t &stream) {
     auto &context_data = context.get_context_data(plain.chain_index_);
